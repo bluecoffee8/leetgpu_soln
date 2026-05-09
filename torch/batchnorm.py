@@ -1,0 +1,14 @@
+import torch
+
+
+# input, gamma, beta, output are tensors on the GPU
+def solve(
+    input: torch.Tensor,
+    gamma: torch.Tensor,
+    beta: torch.Tensor,
+    output: torch.Tensor,
+    N: int,
+    C: int,
+    eps: float,
+):
+    output[:] = torch.nn.functional.batch_norm(input, torch.mean(input, dim=0), torch.var(input, correction=0, dim=0), weight=gamma, bias=beta, eps=eps)
