@@ -1,0 +1,83 @@
+import torch
+import triton
+import triton.language as tl
+
+@triton.jit
+def matrix_multiplication_kernel(
+    a, b, c, M, N, K, stride_am, stride_an, stride_bn, stride_bk, stride_cm, stride_ck,
+    BLOCK_SIZE_M: tl.constexpr, BLOCK_SIZE_N: tl.constexpr, BLOCK_SIZE_K: tl.constexpr, 
+    GROUP_SIZE_M: tl.constexpr,
+):
+    pid = tl.program_id(axis=0)
+    num_pid_m = tl.cdiv(M, BLOCK_SIZE_M)
+    num_pid_k = tl.cdiv(K, BLOCK_SIZE_K)
+    num_pid_in_group = GROUP_SIZE_M * num_pid_k
+    group_id = pid // num_pid_in_group
+    first_pid_m = group_id * GROUP_SIZE_M
+    group_size_m = min(num_pid_m - first_pid_m, GROUP_SIZE_M)
+    pid_m = first_pid_m + ((pid % num_pid_in_group) % group_size_m)
+    pid_k = (pid % num_pid_in_group) // group_size_m
+
+    tl.assume(pid_m >= 0)
+    tl.assume(pid_k >= 0)
+    tl.assume(stride_am > 0)
+    tl.assume(stride_an > 0)
+    tl.assume(stride_bn > 0)
+    tl.assume(stride_bk > 0)
+    tl.assume(stride_cm > 0)
+    tl.assume(stride_ck > 0)
+
+    offs_am = (pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)) % M
+    offs_bk = (pid_k * BLOCK_SIZE_K + tl.arange(0, BLOCK_SIZE_K)) % K
+    offs_n = tl.arange(0, BLOCK_SIZE_N)
+    a_block = a + (offs_am[:, None] * stride_am + offs_n[None, :] * stride_an)
+    b_block = b + (offs_n[:, None] * stride_bn + offs_bk[None, :] * stride_bk)
+
+    accumulator = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_K), dtype=tl.float32)
+    for n in range(0, tl.cdiv(N, BLOCK_SIZE_N)):
+        a_val = tl.load(a_block, mask=offs_n[None, :] < N - n * BLOCK_SIZE_N, other=0.0).to(tl.float32)
+        b_val = tl.load(b_block, mask=offs_n[:, None] < N - n * BLOCK_SIZE_N, other=0.0).to(tl.float32)
+        # accumulator += tl.dot(a_val, b_val, allow_tf32=False)
+        accumulator = tl.dot(a_val, b_val, accumulator, input_precision="ieee")
+        a_block += BLOCK_SIZE_N * stride_an 
+        b_block += BLOCK_SIZE_N * stride_bn
+    c_val = accumulator
+    offs_cm = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
+    offs_ck = pid_k * BLOCK_SIZE_K + tl.arange(0, BLOCK_SIZE_K)
+    c_block = c + stride_cm * offs_cm[:, None] + stride_ck * offs_ck[None, :]
+    c_mask = (offs_cm[:, None] < M) & (offs_ck[None, :] < K)
+    tl.store(c_block, c_val, mask=c_mask)
+
+# input, output are tensors on the GPU
+def solve(input: torch.Tensor, output: torch.Tensor, N: int, P: int):
+    stride_am, stride_an = N, 1
+    stride_bn, stride_bk = N, 1
+    stride_cm, stride_ck = N, 1
+
+    grid = lambda meta: (triton.cdiv(N, meta["BLOCK_SIZE_M"]) * triton.cdiv(N, meta["BLOCK_SIZE_K"]), )
+
+    input = input.to(torch.float32)
+    output = output.to(torch.float32)
+
+    if P == 0:
+        output.copy_(torch.eye(N, dtype=torch.float32).reshape(output.shape))
+    elif P == 1:
+        output.copy_(input.reshape(output.shape).to(torch.float32))
+    elif P % 2 == 1:
+        t = torch.empty((N, N), device='cuda', dtype=torch.float32)
+        solve(input, t, N, P-1) 
+        matrix_multiplication_kernel[grid](input, t, output, N, N, N, stride_am, stride_an, stride_bn, stride_bk, stride_cm, stride_ck,
+            BLOCK_SIZE_M = 64,
+            BLOCK_SIZE_N = 64,
+            BLOCK_SIZE_K = 64,
+            GROUP_SIZE_M = 4
+        )
+    else:
+        t = torch.empty((N, N), device='cuda', dtype=torch.float32)
+        solve(input, t, N, P // 2) 
+        matrix_multiplication_kernel[grid](t, t, output, N, N, N, stride_am, stride_an, stride_bn, stride_bk, stride_cm, stride_ck,
+            BLOCK_SIZE_M = 64,
+            BLOCK_SIZE_N = 64,
+            BLOCK_SIZE_K = 64,
+            GROUP_SIZE_M = 4
+        )
