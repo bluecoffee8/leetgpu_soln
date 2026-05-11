@@ -50,18 +50,14 @@ int main(int argc, char** argv)
     // Default: 10 million elements
     int N = 10'000'000;
 
-    // if (argc > 1) {
-    //     N = std::atoi(argv[1]);
-    // }
-
     size_t bytes = N * sizeof(float);
 
     std::cout << "Vector size: " << N << " elements\n";
     std::cout << "Memory per vector: "
               << (bytes / (1024.0 * 1024.0)) << " MB\n\n";
 
-    // Host vectors
-    std::vector<float> h_a(N);
+    float* h_a = nullptr; 
+    CUDA_CHECK(cudaMallocHost((void**)&h_a, bytes));
 
     // Initialize input data
     for (int i = 0; i < N; ++i) {
@@ -69,9 +65,9 @@ int main(int argc, char** argv)
     }
 
     // Device pointers
-    float *d_a;
+    float *d_a = nullptr;
 
-    CUDA_CHECK(cudaMalloc(&d_a, bytes));
+    CUDA_CHECK(cudaMalloc((void **)&d_a, bytes));
 
     // CUDA events for accurate GPU timing
     cudaEvent_t start, stop;
@@ -82,8 +78,7 @@ int main(int argc, char** argv)
     CUDA_CHECK(cudaEventRecord(start));
 
     // Copy inputs to GPU
-    CUDA_CHECK(cudaMemcpy(d_a, h_a.data(), bytes, cudaMemcpyHostToDevice));
-    CUDA_CHECK(cudaMemcpy(h_a.data(), d_a, bytes, cudaMemcpyDeviceToHost));
+    CUDA_CHECK(cudaMemcpy(d_a, h_a, bytes, cudaMemcpyHostToDevice));
 
     CUDA_CHECK(cudaEventRecord(stop));
     CUDA_CHECK(cudaEventSynchronize(stop));
