@@ -28,14 +28,49 @@ __global__ void reduce(const float* __restrict__ input, float* __restrict__ outp
     if (tid == 0) {
         atomicAdd(output, smem[0]); 
     }
-}   
+}
+
+const int num_threads = 128;
+const int warp_size = 32;
+const int coarse_factor = 4; 
+
+__global__ void warp_reduce(const float* __restrict__ input, float* __restrict__ output, int N) {
+    __shared__ float sdata[num_threads / warp_size];
+
+    int i = blockIdx.x * blockDim.x * coarse_factor + threadIdx.x; 
+    int w_id = threadIdx.x / warp_size;
+    int l_id = threadIdx.x % warp_size; 
+
+    float s = 0.0;
+    for (int j = 0; j < coarse_factor; j++) {
+        int i_ = i + j * num_threads;
+        if (i_ < N) s += input[i_];
+    }
+    for (int b = 16; b > 0; b >>= 1) {
+        s += __shfl_down_sync(0xffffffff, s, b); 
+    }
+    if (l_id == 0) sdata[w_id] = s;
+    __syncthreads(); 
+
+    if (w_id == 0) {
+        s = (threadIdx.x < num_threads / warp_size) ? sdata[threadIdx.x] : 0.0f;
+        for (int b = 16; b > 0; b >>= 1) {
+            s += __shfl_down_sync(0xffffffff, s, b);
+        }
+        if (l_id == 0) {
+            atomicAdd(output, s); 
+        }
+    }
+}
 
 // input, output are device pointers
 extern "C" void solve(const float* input, float* output, int N) {
-    constexpr int BLOCK_SIZE = 256;
-    constexpr int NUM_PER_THREAD = 8; 
+    // constexpr int BLOCK_SIZE = 256;
+    // constexpr int NUM_PER_THREAD = 8; 
 
-    dim3 blockSize(BLOCK_SIZE);
-    dim3 gridSize((N + (BLOCK_SIZE * NUM_PER_THREAD) - 1) / (BLOCK_SIZE * NUM_PER_THREAD));
-    reduce<BLOCK_SIZE, NUM_PER_THREAD><<<gridSize, blockSize>>>(input, output, N); 
+    // dim3 blockSize(BLOCK_SIZE);
+    // dim3 gridSize((N + (BLOCK_SIZE * NUM_PER_THREAD) - 1) / (BLOCK_SIZE * NUM_PER_THREAD));
+    // reduce<BLOCK_SIZE, NUM_PER_THREAD><<<gridSize, blockSize>>>(input, output, N); 
+    int num_blocks = (N + (coarse_factor * num_threads) - 1) / (coarse_factor * num_threads);
+    warp_reduce<<<num_blocks, num_threads>>>(input, output, N);
 }
