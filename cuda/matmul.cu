@@ -196,6 +196,85 @@ __global__ void matmul_v5(const float* A, const float* B, float* C, int M, int N
     }
 }
 
+// v5_padded: fixes the 4-way bank conflict in As reads.
+// Root cause: t_row varies 0..(BM/TM/warp_groups - 1) within a warp, and
+// t_row * TM * BN = t_row * 64 ≡ 0 (mod 32), so all t_row groups map to the
+// same bank. Adding 1 to the As row stride breaks that alignment.
+// Note: Bs has a residual 2-way conflict (t_col stride TK=8 gives period 4 in
+// banks) that requires algorithmic restructuring to eliminate.
+template<const int BM, const int BN, const int BK, const int TM, const int TK>
+__global__ void matmul_v5_padded(const float* A, const float* B, float* C, int M, int N, int K) {
+    constexpr int BN_PAD = BN + 1;
+    constexpr int BK_PAD = BK + 1;
+
+    const unsigned int c_row = blockIdx.y;
+    const unsigned int c_col = blockIdx.x;
+
+    const int t_col = threadIdx.x % (BK / TK);
+    const int t_row = threadIdx.x / (BK / TK);
+
+    __shared__ float As[BM * BN_PAD];
+    __shared__ float Bs[BN * BK_PAD];
+
+    A += c_row * BM * N;
+    B += c_col * BK;
+    C += c_row * BM * K + c_col * BK;
+
+    const unsigned int a_col = threadIdx.x % BN;
+    const unsigned int a_row = threadIdx.x / BN;
+    const unsigned int stride_a = blockDim.x / BN;
+
+    const unsigned int b_col = threadIdx.x % BK;
+    const unsigned int b_row = threadIdx.x / BK;
+    const unsigned int stride_b = blockDim.x / BK;
+
+    float acc[TM * TK] = {0.0};
+    float regM[TM] = {0.0};
+    float regK[TK] = {0.0};
+
+    for (unsigned int n = 0; n < N; n += BN) {
+        for (unsigned int offset = 0; offset < BM; offset += stride_a) {
+            As[(offset + a_row) * BN_PAD + a_col] = A[(offset + a_row) * N + a_col];
+        }
+        for (unsigned int offset = 0; offset < BN; offset += stride_b) {
+            Bs[(offset + b_row) * BK_PAD + b_col] = B[(offset + b_row) * K + b_col];
+        }
+        __syncthreads();
+
+        A += BN;
+        B += BN * K;
+
+        for (unsigned int n_ = 0; n_ < min(N - n, BN); n_++) {
+            for (unsigned int i = 0; i < TM; i++) {
+                regM[i] = As[(t_row * TM + i) * BN_PAD + n_];
+            }
+            for (unsigned int i = 0; i < TK; i++) {
+                regK[i] = Bs[n_ * BK_PAD + t_col * TK + i];
+            }
+            for (unsigned int i = 0; i < TM; i++) {
+                if (c_row * BM + t_row * TM + i < M) {
+                    for (unsigned int j = 0; j < TK; j++) {
+                        if (c_col * BK + t_col * TK + j < K) {
+                            acc[i * TK + j] += regM[i] * regK[j];
+                        }
+                    }
+                }
+            }
+        }
+        __syncthreads();
+    }
+
+    for (unsigned int i = 0; i < TM; i++) {
+        if (c_row * BM + t_row * TM + i < M) {
+            for (unsigned int j = 0; j < TK; j++) {
+                if (c_col * BK + t_col * TK + j < K) {
+                    C[(t_row * TM + i) * K + (t_col * TK + j)] = acc[i * TK + j];
+                }
+            }
+        }
+    }
+}
+
 template<const int BM, const int BN, const int BK, const int TM, const int TK>
 __global__ void matmul_v6(const float* A, const float* B, float* C, int M, int N, int K) {
     const unsigned int c_row = blockIdx.y;
@@ -287,6 +366,103 @@ __global__ void matmul_v6(const float* A, const float* B, float* C, int M, int N
                 if (c_col * BK + t_col * TK + j < K) {
                     C[(t_row * TM + i) * K + (t_col * TK + j)] =
                         acc[i * TK + j];
+                }
+            }
+        }
+    }
+}
+
+// v6_padded: same bank-conflict fix as v5_padded, but retains the float4
+// global reads from v6. Since BN+1=9 isn't float4-store-aligned in smem,
+// the 4 values are scattered individually into the padded As/Bs arrays.
+// The global read is still a single 128-bit load; only the smem write is scalar.
+template<const int BM, const int BN, const int BK, const int TM, const int TK>
+__global__ void matmul_v6_padded(const float* A, const float* B, float* C, int M, int N, int K) {
+    constexpr int BN_PAD = BN + 1;
+    constexpr int BK_PAD = BK + 1;
+
+    const unsigned int c_row = blockIdx.y;
+    const unsigned int c_col = blockIdx.x;
+
+    const int t_col = threadIdx.x % (BK / TK);
+    const int t_row = threadIdx.x / (BK / TK);
+
+    __shared__ float As[BM * BN_PAD];
+    __shared__ float Bs[BN * BK_PAD];
+
+    A += c_row * BM * N;
+    B += c_col * BK;
+    C += c_row * BM * K + c_col * BK;
+
+    const unsigned int a_col = (threadIdx.x % (BN / 4)) * 4;
+    const unsigned int a_row = threadIdx.x / (BN / 4);
+    const unsigned int stride_a = blockDim.x / (BN / 4);
+
+    const unsigned int b_col = (threadIdx.x % (BK / 4)) * 4;
+    const unsigned int b_row = threadIdx.x / (BK / 4);
+    const unsigned int stride_b = blockDim.x / (BK / 4);
+
+    float acc[TM * TK] = {0.0};
+    float regM[TM] = {0.0};
+    float regK[TK] = {0.0};
+
+    for (unsigned int n = 0; n < N; n += BN) {
+        #pragma unroll
+        for (unsigned int offset = 0; offset < BM; offset += stride_a) {
+            float4 tmp = *reinterpret_cast<const float4*>(&A[(offset + a_row) * N + a_col]);
+            unsigned int row = offset + a_row;
+            As[row * BN_PAD + a_col + 0] = tmp.x;
+            As[row * BN_PAD + a_col + 1] = tmp.y;
+            As[row * BN_PAD + a_col + 2] = tmp.z;
+            As[row * BN_PAD + a_col + 3] = tmp.w;
+        }
+
+        #pragma unroll
+        for (unsigned int offset = 0; offset < BN; offset += stride_b) {
+            float4 tmp = *reinterpret_cast<const float4*>(&B[(offset + b_row) * K + b_col]);
+            unsigned int row = offset + b_row;
+            Bs[row * BK_PAD + b_col + 0] = tmp.x;
+            Bs[row * BK_PAD + b_col + 1] = tmp.y;
+            Bs[row * BK_PAD + b_col + 2] = tmp.z;
+            Bs[row * BK_PAD + b_col + 3] = tmp.w;
+        }
+
+        __syncthreads();
+
+        A += BN;
+        B += BN * K;
+
+        for (unsigned int n_ = 0; n_ < min(N - n, BN); n_++) {
+            #pragma unroll
+            for (unsigned int i = 0; i < TM; i++) {
+                regM[i] = As[(t_row * TM + i) * BN_PAD + n_];
+            }
+            #pragma unroll
+            for (unsigned int i = 0; i < TK; i++) {
+                regK[i] = Bs[n_ * BK_PAD + t_col * TK + i];
+            }
+            #pragma unroll
+            for (unsigned int i = 0; i < TM; i++) {
+                if (c_row * BM + t_row * TM + i < M) {
+                    #pragma unroll
+                    for (unsigned int j = 0; j < TK; j++) {
+                        if (c_col * BK + t_col * TK + j < K) {
+                            acc[i * TK + j] += regM[i] * regK[j];
+                        }
+                    }
+                }
+            }
+        }
+        __syncthreads();
+    }
+
+    #pragma unroll
+    for (unsigned int i = 0; i < TM; i++) {
+        if (c_row * BM + t_row * TM + i < M) {
+            #pragma unroll
+            for (unsigned int j = 0; j < TK; j++) {
+                if (c_col * BK + t_col * TK + j < K) {
+                    C[(t_row * TM + i) * K + (t_col * TK + j)] = acc[i * TK + j];
                 }
             }
         }
@@ -490,40 +666,40 @@ extern "C" void solve(const float* A, const float* B, float* C, int M, int N, in
     // dim3 blockDim((BM * BK) / TM); 
     // matmul_v4<BM, BN, BK, TM><<<gridDim, blockDim>>>(A, B, C, M, N, K);
 
-    // const int BM = 64; 
-    // const int BN = 8;
-    // const int BK = 64; 
-    // const int TM = 8;
-    // const int TN = 8; 
-
-    // dim3 gridDim(CEIL_DIV(K, BK), CEIL_DIV(M, BM));
-    // dim3 blockDim((BM * BK) / (TM * TN)); 
-    // // matmul_v5<BM, BN, BK, TM, TN><<<gridDim, blockDim>>>(A, B, C, M, N, K);
-    // if (M % 4 == 0 && N % 4 == 0 && K % 4 == 0) {
-    //     matmul_v6<BM, BN, BK, TM, TN><<<gridDim, blockDim>>>(A, B, C, M, N, K);
-    // } else {
-    //     matmul_v5<BM, BN, BK, TM, TN><<<gridDim, blockDim>>>(A, B, C, M, N, K);
-    // }
-
-    const unsigned int NUM_THREADS = 128; 
-    const unsigned int BK = 128;
-    const unsigned int BM = 128; 
-    const unsigned int BN = 16;
-    const unsigned int WK = 64;
-    const unsigned int WM = 64;
-    const unsigned int WKITER = 4;
-    const unsigned int TK = 4;
-    const unsigned int TM = 8;
+    const int BM = 64; 
+    const int BN = 8;
+    const int BK = 64; 
+    const int TM = 8;
+    const int TN = 8; 
 
     dim3 gridDim(CEIL_DIV(K, BK), CEIL_DIV(M, BM));
-
+    dim3 blockDim((BM * BK) / (TM * TN)); 
+    // matmul_v5<BM, BN, BK, TM, TN><<<gridDim, blockDim>>>(A, B, C, M, N, K);
     if (M % 4 == 0 && N % 4 == 0 && K % 4 == 0) {
-        dim3 blockDim(NUM_THREADS); 
-        sgemmWarptiling<BM, BK, BN, WM, WK, WKITER, TM, TK, NUM_THREADS><<<gridDim, blockDim>>>(M, K, N, A, B, C);
+        matmul_v6_padded<BM, BN, BK, TM, TN><<<gridDim, blockDim>>>(A, B, C, M, N, K);
     } else {
-        dim3 blockDim((BM * BK) / (TM * TK)); 
-        matmul_v5<BM, BN, BK, TM, TK><<<gridDim, blockDim>>>(A, B, C, M, N, K);
+        matmul_v5<BM, BN, BK, TM, TN><<<gridDim, blockDim>>>(A, B, C, M, N, K);
     }
 
-    cudaDeviceSynchronize();
+    // const unsigned int NUM_THREADS = 128; 
+    // const unsigned int BK = 128;
+    // const unsigned int BM = 128; 
+    // const unsigned int BN = 16;
+    // const unsigned int WK = 64;
+    // const unsigned int WM = 64;
+    // const unsigned int WKITER = 4;
+    // const unsigned int TK = 4;
+    // const unsigned int TM = 8;
+
+    // dim3 gridDim(CEIL_DIV(K, BK), CEIL_DIV(M, BM));
+
+    // if (M % 4 == 0 && N % 4 == 0 && K % 4 == 0) {
+    //     dim3 blockDim(NUM_THREADS); 
+    //     sgemmWarptiling<BM, BK, BN, WM, WK, WKITER, TM, TK, NUM_THREADS><<<gridDim, blockDim>>>(M, K, N, A, B, C);
+    // } else {
+    //     dim3 blockDim((BM * BK) / (TM * TK)); 
+    //     matmul_v5<BM, BN, BK, TM, TK><<<gridDim, blockDim>>>(A, B, C, M, N, K);
+    // }
+
+    // cudaDeviceSynchronize();
 }
