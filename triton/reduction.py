@@ -13,6 +13,6 @@ def reduce_kernel(input_ptr, output_ptr, N, BLOCK_SIZE: tl.constexpr):
 
 # input, output are tensors on the GPU
 def solve(input: torch.Tensor, output: torch.Tensor, N: int):
-    BLOCK_SIZE = 1024 
+    BLOCK_SIZE = 4096
     grid = lambda meta: (triton.cdiv(N, meta["BLOCK_SIZE"]), )
     reduce_kernel[grid](input, output, N, BLOCK_SIZE)
