@@ -247,7 +247,7 @@ extern "C" void solve(const float* input, float* output, int M, int N) {
 
     // matrix_transpose_kernel<<<blocksPerGrid, threadsPerBlock>>>(input, output, rows, cols);
     // matrix_transpose_kernel_v2<BLOCK_SIZE><<<blocksPerGrid, threadsPerBlock>>>(input, output, M, N);
-    constexpr int BLOCK_SIZE = 32; 
+    constexpr int BLOCK_SIZE = 64;
     constexpr int NUM_PER_THREAD = 4;
     dim3 threadsPerBlock(BLOCK_SIZE, BLOCK_SIZE / NUM_PER_THREAD);
     dim3 blocksPerGrid((N + threadsPerBlock.x - 1) / threadsPerBlock.x,
