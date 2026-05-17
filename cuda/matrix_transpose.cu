@@ -184,6 +184,60 @@ __global__ void matrix_transpose_kernel_v5(const float* input, float* output, in
     }
 }
 
+// XOR swizzling: store element (row, col) at sdata[row][col ^ row].
+// This permutes each row's column layout so that both the coalesced write
+// (all threads same row, different col) and the transposed read (all threads
+// different row, same col) land on distinct banks — no padding required.
+template<int BLOCK_SIZE, int NUM_PER_THREAD>
+__global__ void matrix_transpose_kernel_v6(const float* input, float* output, int M, int N) {
+    const int bx = blockIdx.x, by = blockIdx.y;
+    const int tx = threadIdx.x, ty = threadIdx.y;
+
+    __shared__ float sdata[BLOCK_SIZE][BLOCK_SIZE];
+
+    int x = bx * BLOCK_SIZE + tx;
+    int y = by * BLOCK_SIZE + ty;
+
+    constexpr int ROW_STRIDE = BLOCK_SIZE / NUM_PER_THREAD;
+
+    if (x < N) {
+        if (y + BLOCK_SIZE <= M) {
+            #pragma unroll
+            for (int y_off = 0; y_off < BLOCK_SIZE; y_off += ROW_STRIDE) {
+                int row = ty + y_off;
+                sdata[row][tx ^ row] = input[(y + y_off) * N + x];
+            }
+        } else {
+            for (int y_off = 0; y_off < BLOCK_SIZE; y_off += ROW_STRIDE) {
+                int row = ty + y_off;
+                if (y + y_off < M) {
+                    sdata[row][tx ^ row] = input[(y + y_off) * N + x];
+                }
+            }
+        }
+    }
+    __syncthreads();
+
+    x = by * BLOCK_SIZE + tx;
+    y = bx * BLOCK_SIZE + ty;
+    if (x < M) {
+        if (y + BLOCK_SIZE <= N) {
+            #pragma unroll
+            for (int y_off = 0; y_off < BLOCK_SIZE; y_off += ROW_STRIDE) {
+                int col = ty + y_off;
+                output[(y + y_off) * M + x] = sdata[tx][col ^ tx];
+            }
+        } else {
+            for (int y_off = 0; y_off < BLOCK_SIZE; y_off += ROW_STRIDE) {
+                int col = ty + y_off;
+                if (y + y_off < N) {
+                    output[(y + y_off) * M + x] = sdata[tx][col ^ tx];
+                }
+            }
+        }
+    }
+}
+
 // input, output are device pointers (i.e. pointers to memory on the GPU)
 extern "C" void solve(const float* input, float* output, int M, int N) {
     // constexpr int BLOCK_SIZE = 16;
@@ -198,7 +252,7 @@ extern "C" void solve(const float* input, float* output, int M, int N) {
     dim3 threadsPerBlock(BLOCK_SIZE, BLOCK_SIZE / NUM_PER_THREAD);
     dim3 blocksPerGrid((N + threadsPerBlock.x - 1) / threadsPerBlock.x,
                        (M + threadsPerBlock.y - 1) / threadsPerBlock.y);
-    matrix_transpose_kernel_v5<BLOCK_SIZE, NUM_PER_THREAD><<<blocksPerGrid, threadsPerBlock>>>(input, output, M, N); 
+    matrix_transpose_kernel_v6<BLOCK_SIZE, NUM_PER_THREAD><<<blocksPerGrid, threadsPerBlock>>>(input, output, M, N);
 
     cudaDeviceSynchronize();
 }
