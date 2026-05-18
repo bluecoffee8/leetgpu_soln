@@ -35,7 +35,7 @@ __global__ void conv2d(const float* __restrict__ input, float* __restrict__ outp
 
 __global__ void conv2d_fast(const float* __restrict__ input, float* __restrict__ output, int i_rows,
                       int i_cols, int k_rows, int k_cols, int o_rows, int o_cols) {
-    __shared__ float smem[BLOCK_SIZE + KERNEL_SIZE][BLOCK_SIZE + KERNEL_SIZE]; 
+    __shared__ float smem[BLOCK_SIZE + KERNEL_SIZE][BLOCK_SIZE + KERNEL_SIZE + 1];
 
     const int ty = threadIdx.y; 
     const int tx = threadIdx.x;

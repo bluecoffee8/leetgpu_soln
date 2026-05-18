@@ -238,14 +238,21 @@ __global__ void matmul_v7_morton(const half* A, const half* B, half* C, int M, i
         B += BN * K;
 
         for (unsigned int n_ = 0; n_ < min(N - n, BN); n_++) {
+            #pragma unroll
             for (unsigned int i = 0; i < TM; i++) {
                 regM[i] = __half2float(As[(t_row * TM + i) * BN_PAD + n_]);
             }
-            for (unsigned int i = 0; i < TK; i++) {
-                regK[i] = __half2float(Bs[n_ * BK_PAD + t_col * TK + i]);
+            #pragma unroll
+            for (unsigned int i = 0; i < TK; i += 2) {
+                float2 f2 = __half22float2(*reinterpret_cast<const half2*>(
+                    &Bs[n_ * BK_PAD + t_col * TK + i]));
+                regK[i]     = f2.x;
+                regK[i + 1] = f2.y;
             }
+            #pragma unroll
             for (unsigned int i = 0; i < TM; i++) {
                 if (c_row * BM + t_row * TM + i < M) {
+                    #pragma unroll
                     for (unsigned int j = 0; j < TK; j++) {
                         if (c_col * BK + t_col * TK + j < K) {
                             acc[i * TK + j] += regM[i] * regK[j];
