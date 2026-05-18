@@ -5,17 +5,17 @@
  * ── Compilation ──────────────────────────────────────────────────────────────
  *
  * Linux / GCC (x86-64):
- *   g++ -O3 -march=native -ffast-math -std=c++17 -o matmul matmul.cpp -lpthread
+ *   g++ -O3 -march=native -ffast-math -std=c++17 -o matmul.o matmul.cpp -lpthread
  *
  * macOS / Apple Clang (Apple Silicon or Intel):
- *   clang++ -O3 -march=native -ffast-math -std=c++17 -o matmul matmul.cpp
+ *   clang++ -O3 -march=native -ffast-math -std=c++17 -o matmul.o matmul.cpp
  *
  * ── Running ───────────────────────────────────────────────────────────────────
  *
- *   ./matmul
+ *   ./matmul.o
  *
  *   Thread count defaults to hardware_concurrency(). Override at compile time:
- *     clang++ ... -DNUM_THREADS=4 -o matmul matmul.cpp
+ *     clang++ ... -DNUM_THREADS=4 -o matmul.o matmul.cpp
  *
  * ── Why these flags matter ───────────────────────────────────────────────────
  *
@@ -31,7 +31,7 @@
  *   Kernel                 Time     GFLOPS
  *   ──────────────────────────────────────
  *   1. Naive IJK           ~1500ms    ~1.4
- *   2. Register accum      ~1500ms    ~1.4
+ *   2. Register accum      ~1000ms    ~2.1
  *   3. IKJ reorder           ~90ms   ~23
  *   4. IKJ + K-tiling        ~70ms   ~30
  *   5. 2D tile + threads     ~16ms  ~130  (8 threads)
