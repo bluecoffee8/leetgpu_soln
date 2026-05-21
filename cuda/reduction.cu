@@ -69,7 +69,7 @@ __global__ void warp_reduce(const float* __restrict__ input, float* __restrict__
 __global__ void coop_groups_reduce(const float* __restrict__ input, float* __restrict__ output, int N) {
     // Get the current thread block as a cooperative group
     auto block = cg::this_thread_block();
-    __shared__ float smem[256];
+    __shared__ float smem[128];
 
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     int stride = gridDim.x * blockDim.x;
