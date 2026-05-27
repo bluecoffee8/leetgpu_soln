@@ -2,10 +2,10 @@
  * Minimal Open MPI Array Summation Example
  *
  * Compilation:
- *   mpic++ reduction_openmpi.cpp -o reduction_openmpi
+ *   mpic++ reduction_openmpi.cpp -o reduction_openmpi.o
  *
  * Running:
- *   mpirun -np 4 ./reduction_openmpi
+ *   mpirun -np 4 ./reduction_openmpi.o
  *
  * This program distributes array summation across multiple MPI processes.
  * Each process computes a local sum, then MPI_Reduce combines all partial
