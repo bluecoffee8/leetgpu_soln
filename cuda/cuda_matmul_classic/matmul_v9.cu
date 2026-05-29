@@ -88,16 +88,19 @@ __global__ __launch_bounds__(NUM_THREADS) void matmul_vectorized(float* A, float
 
     __shared__ float As[BLOCK_SIZE * BLOCK_SIZE], Bs[BLOCK_SIZE * BLOCK_SIZE]; 
 
+    // Advance the block tiles via pointer arithmetic; shared-memory indices stay local.
     A += bm * BLOCK_SIZE * N;
-    C += bm * BLOCK_SIZE * K + bk * BLOCK_SIZE; 
+    B += bk * BLOCK_SIZE;
+    // C must be moved to this warp's output tile, not just the block's origin.
+    C += (bm * BLOCK_SIZE + warp_m * WARP_BLOCK_SIZE) * K + bk * BLOCK_SIZE + warp_k * WARP_BLOCK_SIZE;
 
     int a_m = threadIdx.x / (BLOCK_SIZE / 4);
     const int a_n_offset = (threadIdx.x % (BLOCK_SIZE / 4)) * 4;
     const int a_stride = (NUM_THREADS * 4) / BLOCK_SIZE;
 
     int b_n = threadIdx.x / (BLOCK_SIZE / 4);
-    int b_k = bk * BLOCK_SIZE + (threadIdx.x % (BLOCK_SIZE / 4)) * 4;
-    const int b_stride = (NUM_THREADS) / (BLOCK_SIZE / 4); 
+    int b_k = (threadIdx.x % (BLOCK_SIZE / 4)) * 4;
+    const int b_stride = (NUM_THREADS) / (BLOCK_SIZE / 4);
 
     float tmp[WARP_M_ITER * T * WARP_K_ITER * T] = {0.0f}; 
     float reg_m[WARP_M_ITER * T] = {0.0f};
@@ -105,8 +108,7 @@ __global__ __launch_bounds__(NUM_THREADS) void matmul_vectorized(float* A, float
 
     #pragma unroll
     for (int n = 0; n < N; n += BLOCK_SIZE) {
-        int a_n = n + a_n_offset;
-        wt::load_from_gmem<BLOCK_SIZE, a_stride, b_stride>(A, B, As, Bs, a_m, a_n, b_n, b_k, N, K);
+        wt::load_from_gmem<BLOCK_SIZE, a_stride, b_stride>(A, B, As, Bs, a_m, a_n_offset, b_n, b_k, N, K);
         __syncthreads();
         wt::process_from_smem<BLOCK_SIZE, WARP_BLOCK_SIZE, WARP_M_ITER, WARP_K_ITER, WARP_SUB_M, WARP_SUB_K, T>(
             As, Bs, reg_m, reg_k, tmp, warp_m, warp_k, lane_m, lane_k, n, N
@@ -117,14 +119,20 @@ __global__ __launch_bounds__(NUM_THREADS) void matmul_vectorized(float* A, float
     }
     for (int x = 0; x < WARP_M_ITER; x++) {
         for (int y = 0; y < WARP_K_ITER; y++) {
+            // C already points at this warp's tile; move to the current warp subtile.
             float* Ctmp = C + (x * WARP_SUB_M) * K + (y * WARP_SUB_K);
-            for (int i = 0; i < min(T, M - bm * BLOCK_SIZE - x * WARP_SUB_M - lane_m * T); i += 1) {
-                for (int j = 0; j < min(T, K - bk * BLOCK_SIZE - y * WARP_SUB_K - lane_k * T); j += 4) {
-                    if (j + 3 < K - bk * BLOCK_SIZE - y * WARP_SUB_K - lane_k * T) {
-                        FETCH_FLOAT4(Ctmp[OFFSET(lane_m * T + i, lane_k * T + j, K)]) = FETCH_FLOAT4(tmp[OFFSET(x * WARP_SUB_M + i, y * WARP_SUB_K + j, WARP_K_ITER * T)]);
+            for (int i = 0; i < T; i++) {
+                int row = bm * BLOCK_SIZE + warp_m * WARP_BLOCK_SIZE + x * WARP_SUB_M + lane_m * T + i;
+                if (row >= M) break;
+                for (int j = 0; j < T; j += 4) {
+                    int col = bk * BLOCK_SIZE + warp_k * WARP_BLOCK_SIZE + y * WARP_SUB_K + lane_k * T + j;
+                    // tmp index must match the accumulation layout in process_from_smem.
+                    int idx = (x * T + i) * (WARP_K_ITER * T) + y * T + j;
+                    if (col + 3 < K) {
+                        FETCH_FLOAT4(Ctmp[OFFSET(lane_m * T + i, lane_k * T + j, K)]) = FETCH_FLOAT4(tmp[idx]);
                     } else {
-                        for (int j_ = j; j_ < min(T, K - bk * BLOCK_SIZE - y * WARP_SUB_K - lane_k * T); j_++) {
-                            Ctmp[OFFSET(lane_m * T + i, lane_k * T + j_, K)] = tmp[OFFSET(x * WARP_SUB_M + i, y * WARP_SUB_K + j_, WARP_K_ITER * T)];
+                        for (int j_ = j; j_ < T && col + (j_ - j) < K; j_++) {
+                            Ctmp[OFFSET(lane_m * T + i, lane_k * T + j_, K)] = tmp[(x * T + i) * (WARP_K_ITER * T) + y * T + j_];
                         }
                     }
                 }
