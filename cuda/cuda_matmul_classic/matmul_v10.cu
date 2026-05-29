@@ -86,33 +86,48 @@ __global__ __launch_bounds__(NUM_THREADS) void matmul_vectorized(
 
         #pragma unroll
         for (int kk = 0; kk < BLOCK_K; kk += WMMA_K) {
+            // 3xTF32: split each FP32 value x into x_hi + x_lo, both TF32-rounded,
+            // then accumulate the three highest-order products and drop the
+            // negligible a_lo*b_lo term. This recovers ~20 mantissa bits.
             wmma::fragment<wmma::matrix_a, WMMA_M, WMMA_N, WMMA_K,
-                           wmma::precision::tf32, wmma::row_major> a_frag[WARP_M_TILES];
+                           wmma::precision::tf32, wmma::row_major> a_hi[WARP_M_TILES], a_lo[WARP_M_TILES];
             wmma::fragment<wmma::matrix_b, WMMA_M, WMMA_N, WMMA_K,
-                           wmma::precision::tf32, wmma::row_major> b_frag[WARP_N_TILES];
+                           wmma::precision::tf32, wmma::row_major> b_hi[WARP_N_TILES], b_lo[WARP_N_TILES];
 
             #pragma unroll
             for (int i = 0; i < WARP_M_TILES; i++) {
                 int a_row = warp_row * WARP_M_TILES * WMMA_M + i * WMMA_M;
-                wmma::load_matrix_sync(a_frag[i], &As[OFFSET(a_row, kk, BLOCK_K)], BLOCK_K);
+                wmma::load_matrix_sync(a_hi[i], &As[OFFSET(a_row, kk, BLOCK_K)], BLOCK_K);
                 #pragma unroll
-                for (int t = 0; t < a_frag[i].num_elements; t++)
-                    a_frag[i].x[t] = wmma::__float_to_tf32(a_frag[i].x[t]);
+                for (int t = 0; t < a_hi[i].num_elements; t++) {
+                    float orig = a_hi[i].x[t];
+                    float hi = wmma::__float_to_tf32(orig);
+                    a_lo[i].x[t] = wmma::__float_to_tf32(orig - hi);
+                    a_hi[i].x[t] = hi;
+                }
             }
             #pragma unroll
             for (int j = 0; j < WARP_N_TILES; j++) {
                 int b_col = warp_col * WARP_N_TILES * WMMA_N + j * WMMA_N;
-                wmma::load_matrix_sync(b_frag[j], &Bs[OFFSET(kk, b_col, BLOCK_N)], BLOCK_N);
+                wmma::load_matrix_sync(b_hi[j], &Bs[OFFSET(kk, b_col, BLOCK_N)], BLOCK_N);
                 #pragma unroll
-                for (int t = 0; t < b_frag[j].num_elements; t++)
-                    b_frag[j].x[t] = wmma::__float_to_tf32(b_frag[j].x[t]);
+                for (int t = 0; t < b_hi[j].num_elements; t++) {
+                    float orig = b_hi[j].x[t];
+                    float hi = wmma::__float_to_tf32(orig);
+                    b_lo[j].x[t] = wmma::__float_to_tf32(orig - hi);
+                    b_hi[j].x[t] = hi;
+                }
             }
 
+            // Accumulate correction terms first, then the dominant a_hi*b_hi term.
             #pragma unroll
             for (int i = 0; i < WARP_M_TILES; i++)
                 #pragma unroll
-                for (int j = 0; j < WARP_N_TILES; j++)
-                    wmma::mma_sync(acc[i][j], a_frag[i], b_frag[j], acc[i][j]);
+                for (int j = 0; j < WARP_N_TILES; j++) {
+                    wmma::mma_sync(acc[i][j], a_lo[i], b_hi[j], acc[i][j]);
+                    wmma::mma_sync(acc[i][j], a_hi[i], b_lo[j], acc[i][j]);
+                    wmma::mma_sync(acc[i][j], a_hi[i], b_hi[j], acc[i][j]);
+                }
         }
         __syncthreads();
     }
