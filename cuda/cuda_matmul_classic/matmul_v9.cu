@@ -95,7 +95,7 @@ __global__ __launch_bounds__(NUM_THREADS) void matmul_vectorized(float* A, float
     C += (bm * BLOCK_SIZE + warp_m * WARP_BLOCK_SIZE) * K + bk * BLOCK_SIZE + warp_k * WARP_BLOCK_SIZE;
 
     int a_m = threadIdx.x / (BLOCK_SIZE / 4);
-    const int a_n_offset = (threadIdx.x % (BLOCK_SIZE / 4)) * 4;
+    const int a_n = (threadIdx.x % (BLOCK_SIZE / 4)) * 4;
     const int a_stride = (NUM_THREADS * 4) / BLOCK_SIZE;
 
     int b_n = threadIdx.x / (BLOCK_SIZE / 4);
@@ -108,7 +108,7 @@ __global__ __launch_bounds__(NUM_THREADS) void matmul_vectorized(float* A, float
 
     #pragma unroll
     for (int n = 0; n < N; n += BLOCK_SIZE) {
-        wt::load_from_gmem<BLOCK_SIZE, a_stride, b_stride>(A, B, As, Bs, a_m, a_n_offset, b_n, b_k, N, K);
+        wt::load_from_gmem<BLOCK_SIZE, a_stride, b_stride>(A, B, As, Bs, a_m, a_n, b_n, b_k, N, K);
         __syncthreads();
         wt::process_from_smem<BLOCK_SIZE, WARP_BLOCK_SIZE, WARP_M_ITER, WARP_K_ITER, WARP_SUB_M, WARP_SUB_K, T>(
             As, Bs, reg_m, reg_k, tmp, warp_m, warp_k, lane_m, lane_k, n, N
