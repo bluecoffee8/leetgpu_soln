@@ -100,7 +100,7 @@ __global__ __launch_bounds__(NUM_THREADS) void matmul_vectorized(float* A, float
 
     int b_n = threadIdx.x / (BLOCK_SIZE / 4);
     int b_k = (threadIdx.x % (BLOCK_SIZE / 4)) * 4;
-    const int b_stride = (NUM_THREADS) / (BLOCK_SIZE / 4);
+    const int b_stride = (NUM_THREADS * 4) / BLOCK_SIZE;
 
     float tmp[WARP_M_ITER * T * WARP_K_ITER * T] = {0.0f}; 
     float reg_m[WARP_M_ITER * T] = {0.0f};
