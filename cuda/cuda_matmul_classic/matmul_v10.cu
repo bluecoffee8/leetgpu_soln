@@ -1,4 +1,7 @@
 #include <cuda_runtime.h>
+#include <mma.h>
+
+using namespace nvcuda;
 
 __global__ __launch_bounds__(1024) void matmul(float* A, float* B, float* C, int M, int N, int K) {
     int m = blockIdx.y * blockDim.y + threadIdx.y;
@@ -9,154 +12,146 @@ __global__ __launch_bounds__(1024) void matmul(float* A, float* B, float* C, int
         tmp += A[m * N + n] * B[n * K + k];
     }
     if (m < M && k < K) {
-        C[m * K + k] = tmp; 
+        C[m * K + k] = tmp;
     }
 }
 
-const int WARPSIZE = 32;
 #define OFFSET(row, col, ld) ((row)*(ld)+(col))
-#define FETCH_FLOAT4(pointer) (reinterpret_cast<float4*>(&(pointer))[0])
 
-namespace wt {
-    template<const int BLOCK_SIZE, const int a_stride, const int b_stride> 
-    __device__ void load_from_gmem(float* A, float* B, float* As, float* Bs, int a_m, int a_n, int b_n, int b_k, int N, int K) {
-        #pragma unroll
-        for (int i = 0; i + a_stride <= BLOCK_SIZE; i += a_stride) {
-            const float4 tmp = FETCH_FLOAT4(A[OFFSET(a_m + i, a_n, N)]);
-            As[OFFSET(a_n, a_m + i, BLOCK_SIZE)] = tmp.x;
-            As[OFFSET(a_n + 1, a_m + i, BLOCK_SIZE)] = tmp.y;
-            As[OFFSET(a_n + 2, a_m + i, BLOCK_SIZE)] = tmp.z;
-            As[OFFSET(a_n + 3, a_m + i, BLOCK_SIZE)] = tmp.w;
-        }
-        #pragma unroll
-        for (int i = 0; i + b_stride <= BLOCK_SIZE; i += b_stride) {
-            FETCH_FLOAT4(Bs[OFFSET(b_n + i, b_k, BLOCK_SIZE)]) = FETCH_FLOAT4(B[OFFSET(b_n + i, b_k, K)]);
-        }
-    }
+// TF32 tensor-core tile shape (Ampere+, SM_80). The wmma GEMM computes
+// D[WMMA_M x WMMA_N] = A[WMMA_M x WMMA_K] * B[WMMA_K x WMMA_N]. Mapping our
+// problem C[M][K] = A[M][N] * B[N][K] onto it: rows = m, cols = k, and the
+// contraction WMMA_K runs along n.
+static const int WMMA_M = 16;
+static const int WMMA_N = 16;
+static const int WMMA_K = 8;
 
-    template<const int BLOCK_SIZE, const int WARP_BLOCK_SIZE, const int WARP_M_ITER, const int WARP_K_ITER, const int WARP_SUB_M, const int WARP_SUB_K, const int T>
-    __device__ void process_from_smem(float* As, float* Bs, float* reg_m, float* reg_k, float* tmp, 
-                                      const int warp_m, const int warp_k, const int lane_m, const int lane_k, int n, int N) {
-        for (int i = 0; i < BLOCK_SIZE; i++) {
-            if (n + i < N) {
-                #pragma unroll 
-                for (int j = 0; j < WARP_M_ITER; j++) {
-                    for (int l = 0; l < T; l++) {
-                        reg_m[j * T + l] = As[i * BLOCK_SIZE + warp_m * WARP_BLOCK_SIZE + j * WARP_SUB_M + lane_m * T + l];
-                    }
-                }
+// Tensor-core matmul: C[M][K] = A[M][N] * B[N][K] (all row-major).
+//   BLOCK_M  - block output tile height (along m)
+//   BLOCK_N  - block output tile width  (along k)
+//   BLOCK_K  - contraction tile depth   (along n), must be a multiple of WMMA_K
+//   WARP_ROWS/WARP_COLS - warp grid within the block (warps along m / k)
+//   NUM_THREADS = WARP_ROWS * WARP_COLS * WARPSIZE
+// A/B tiles are zero-padded in shared memory so out-of-range threads contribute
+// nothing, which lets the kernel handle arbitrary M, N, K without alignment.
+template<const int BLOCK_M, const int BLOCK_N, const int BLOCK_K,
+         const int WARP_ROWS, const int WARP_COLS, const int NUM_THREADS>
+__global__ __launch_bounds__(NUM_THREADS) void matmul_vectorized(
+        const float* __restrict__ A, const float* __restrict__ B,
+        float* __restrict__ C, int M, int N, int K) {
+    // Number of 16x16 wmma tiles each warp owns along m / k.
+    constexpr int WARP_M_TILES = BLOCK_M / (WARP_ROWS * WMMA_M);
+    constexpr int WARP_N_TILES = BLOCK_N / (WARP_COLS * WMMA_N);
 
-                #pragma unroll 
-                for (int j = 0; j < WARP_K_ITER; j++) {
-                    for (int l = 0; l < T; l++) {
-                        reg_k[j * T + l] = Bs[i * BLOCK_SIZE + warp_k * WARP_BLOCK_SIZE + j * WARP_SUB_K + lane_k * T + l];
-                    }
-                }
+    const int block_row = blockIdx.y * BLOCK_M; // first output row (m)
+    const int block_col = blockIdx.x * BLOCK_N; // first output col (k)
 
-                #pragma unroll
-                for (int x = 0; x < WARP_M_ITER; x++) {
-                    for (int y = 0; y < WARP_K_ITER; y++) {
-                        for (int i = 0; i < T; i++) {
-                            for (int j = 0; j < T; j++) {
-                                tmp[(x * T + i) * (WARP_K_ITER * T) + (y * T + j)]
-                                    += reg_m[x * T + i] * reg_k[y * T + j];
-                            }
-                        }
-                    }
-                }
-            }
-        }
-    }
-}
+    const int warp_id  = threadIdx.x / warpSize;
+    const int warp_row = warp_id / WARP_COLS;   // this warp's tile row (m)
+    const int warp_col = warp_id % WARP_COLS;   // this warp's tile col (k)
 
-template<const int BLOCK_SIZE, const int WARP_BLOCK_SIZE, const int WARP_K_ITER, const int T, const int NUM_THREADS>
-__global__ __launch_bounds__(NUM_THREADS) void matmul_vectorized(float* A, float* B, float* C, int M, int N, int K) {
-    int bm = blockIdx.y; 
-    int bk = blockIdx.x;
+    // As holds A[m][n] (BLOCK_M x BLOCK_K), Bs holds B[n][k] (BLOCK_K x BLOCK_N).
+    // Cs stages the block's output (BLOCK_M x BLOCK_N) before the bounds-checked
+    // write-back to global memory.
+    __shared__ float As[BLOCK_M * BLOCK_K];
+    __shared__ float Bs[BLOCK_K * BLOCK_N];
+    __shared__ float Cs[BLOCK_M * BLOCK_N];
 
-    const int warp_idx = threadIdx.x / WARPSIZE; 
-    const int warp_m = warp_idx / (BLOCK_SIZE / WARP_BLOCK_SIZE); 
-    const int warp_k = warp_idx % (BLOCK_SIZE / WARP_BLOCK_SIZE);
-
-    constexpr int WARP_M_ITER = (WARP_BLOCK_SIZE * WARP_BLOCK_SIZE) / (WARPSIZE * T * T * WARP_K_ITER);
-    constexpr int WARP_SUB_M = WARP_BLOCK_SIZE / WARP_M_ITER;
-    constexpr int WARP_SUB_K = WARP_BLOCK_SIZE / WARP_K_ITER; 
-
-    const int lane_idx = threadIdx.x % WARPSIZE;
-    const int lane_m = lane_idx / (WARP_SUB_K / T);
-    const int lane_k = lane_idx % (WARP_SUB_K / T); 
-
-    __shared__ float As[BLOCK_SIZE * BLOCK_SIZE], Bs[BLOCK_SIZE * BLOCK_SIZE]; 
-
-    // Advance the block tiles via pointer arithmetic; shared-memory indices stay local.
-    A += bm * BLOCK_SIZE * N;
-    B += bk * BLOCK_SIZE;
-    // C must be moved to this warp's output tile, not just the block's origin.
-    C += (bm * BLOCK_SIZE + warp_m * WARP_BLOCK_SIZE) * K + bk * BLOCK_SIZE + warp_k * WARP_BLOCK_SIZE;
-
-    int a_m = threadIdx.x / (BLOCK_SIZE / 4);
-    const int a_n = (threadIdx.x % (BLOCK_SIZE / 4)) * 4;
-    const int a_stride = (NUM_THREADS * 4) / BLOCK_SIZE;
-
-    int b_n = threadIdx.x / (BLOCK_SIZE / 4);
-    int b_k = (threadIdx.x % (BLOCK_SIZE / 4)) * 4;
-    const int b_stride = (NUM_THREADS * 4) / BLOCK_SIZE;
-
-    float tmp[WARP_M_ITER * T * WARP_K_ITER * T] = {0.0f}; 
-    float reg_m[WARP_M_ITER * T] = {0.0f};
-    float reg_k[WARP_K_ITER * T] = {0.0f};
-
+    wmma::fragment<wmma::accumulator, WMMA_M, WMMA_N, WMMA_K, float>
+        acc[WARP_M_TILES][WARP_N_TILES];
     #pragma unroll
-    for (int n = 0; n < N; n += BLOCK_SIZE) {
-        wt::load_from_gmem<BLOCK_SIZE, a_stride, b_stride>(A, B, As, Bs, a_m, a_n, b_n, b_k, N, K);
+    for (int i = 0; i < WARP_M_TILES; i++)
+        #pragma unroll
+        for (int j = 0; j < WARP_N_TILES; j++)
+            wmma::fill_fragment(acc[i][j], 0.0f);
+
+    for (int n0 = 0; n0 < N; n0 += BLOCK_K) {
+        // Stage A tile (zero-padded outside the matrix).
+        for (int idx = threadIdx.x; idx < BLOCK_M * BLOCK_K; idx += NUM_THREADS) {
+            int r = idx / BLOCK_K;          // m within tile
+            int c = idx % BLOCK_K;          // n within tile
+            int gm = block_row + r;
+            int gn = n0 + c;
+            As[idx] = (gm < M && gn < N) ? A[OFFSET(gm, gn, N)] : 0.0f;
+        }
+        // Stage B tile (zero-padded outside the matrix).
+        for (int idx = threadIdx.x; idx < BLOCK_K * BLOCK_N; idx += NUM_THREADS) {
+            int r = idx / BLOCK_N;          // n within tile
+            int c = idx % BLOCK_N;          // k within tile
+            int gn = n0 + r;
+            int gk = block_col + c;
+            Bs[idx] = (gn < N && gk < K) ? B[OFFSET(gn, gk, K)] : 0.0f;
+        }
         __syncthreads();
-        wt::process_from_smem<BLOCK_SIZE, WARP_BLOCK_SIZE, WARP_M_ITER, WARP_K_ITER, WARP_SUB_M, WARP_SUB_K, T>(
-            As, Bs, reg_m, reg_k, tmp, warp_m, warp_k, lane_m, lane_k, n, N
-        );
-        A += BLOCK_SIZE;
-        B += BLOCK_SIZE * K;
+
+        #pragma unroll
+        for (int kk = 0; kk < BLOCK_K; kk += WMMA_K) {
+            wmma::fragment<wmma::matrix_a, WMMA_M, WMMA_N, WMMA_K,
+                           wmma::precision::tf32, wmma::row_major> a_frag[WARP_M_TILES];
+            wmma::fragment<wmma::matrix_b, WMMA_M, WMMA_N, WMMA_K,
+                           wmma::precision::tf32, wmma::row_major> b_frag[WARP_N_TILES];
+
+            #pragma unroll
+            for (int i = 0; i < WARP_M_TILES; i++) {
+                int a_row = warp_row * WARP_M_TILES * WMMA_M + i * WMMA_M;
+                wmma::load_matrix_sync(a_frag[i], &As[OFFSET(a_row, kk, BLOCK_K)], BLOCK_K);
+                #pragma unroll
+                for (int t = 0; t < a_frag[i].num_elements; t++)
+                    a_frag[i].x[t] = wmma::__float_to_tf32(a_frag[i].x[t]);
+            }
+            #pragma unroll
+            for (int j = 0; j < WARP_N_TILES; j++) {
+                int b_col = warp_col * WARP_N_TILES * WMMA_N + j * WMMA_N;
+                wmma::load_matrix_sync(b_frag[j], &Bs[OFFSET(kk, b_col, BLOCK_N)], BLOCK_N);
+                #pragma unroll
+                for (int t = 0; t < b_frag[j].num_elements; t++)
+                    b_frag[j].x[t] = wmma::__float_to_tf32(b_frag[j].x[t]);
+            }
+
+            #pragma unroll
+            for (int i = 0; i < WARP_M_TILES; i++)
+                #pragma unroll
+                for (int j = 0; j < WARP_N_TILES; j++)
+                    wmma::mma_sync(acc[i][j], a_frag[i], b_frag[j], acc[i][j]);
+        }
         __syncthreads();
     }
-    for (int x = 0; x < WARP_M_ITER; x++) {
-        for (int y = 0; y < WARP_K_ITER; y++) {
-            // C already points at this warp's tile; move to the current warp subtile.
-            float* Ctmp = C + (x * WARP_SUB_M) * K + (y * WARP_SUB_K);
-            for (int i = 0; i < T; i++) {
-                int row = bm * BLOCK_SIZE + warp_m * WARP_BLOCK_SIZE + x * WARP_SUB_M + lane_m * T + i;
-                if (row >= M) break;
-                for (int j = 0; j < T; j += 4) {
-                    int col = bk * BLOCK_SIZE + warp_k * WARP_BLOCK_SIZE + y * WARP_SUB_K + lane_k * T + j;
-                    // tmp index must match the accumulation layout in process_from_smem.
-                    int idx = (x * T + i) * (WARP_K_ITER * T) + y * T + j;
-                    if (col + 3 < K) {
-                        FETCH_FLOAT4(Ctmp[OFFSET(lane_m * T + i, lane_k * T + j, K)]) = FETCH_FLOAT4(tmp[idx]);
-                    } else {
-                        for (int j_ = j; j_ < T && col + (j_ - j) < K; j_++) {
-                            Ctmp[OFFSET(lane_m * T + i, lane_k * T + j_, K)] = tmp[(x * T + i) * (WARP_K_ITER * T) + y * T + j_];
-                        }
-                    }
-                }
-            }
+
+    // Store each warp's accumulators into the shared output tile.
+    #pragma unroll
+    for (int i = 0; i < WARP_M_TILES; i++) {
+        #pragma unroll
+        for (int j = 0; j < WARP_N_TILES; j++) {
+            int c_row = warp_row * WARP_M_TILES * WMMA_M + i * WMMA_M;
+            int c_col = warp_col * WARP_N_TILES * WMMA_N + j * WMMA_N;
+            wmma::store_matrix_sync(&Cs[OFFSET(c_row, c_col, BLOCK_N)], acc[i][j],
+                                    BLOCK_N, wmma::mem_row_major);
         }
+    }
+    __syncthreads();
+
+    // Bounds-checked write-back from shared to global memory.
+    for (int idx = threadIdx.x; idx < BLOCK_M * BLOCK_N; idx += NUM_THREADS) {
+        int r = idx / BLOCK_N;
+        int c = idx % BLOCK_N;
+        int gm = block_row + r;
+        int gk = block_col + c;
+        if (gm < M && gk < K)
+            C[OFFSET(gm, gk, K)] = Cs[idx];
     }
 }
 
 // A, B, C are device pointers (i.e. pointers to memory on the GPU)
 extern "C" void solve(float* A, float* B, float* C, int M, int N, int K) {
-    if (M % 4 == 0 && N % 4 == 0 && K % 4 == 0) {
-        const int BLOCK_SIZE = 64, T = 4, WARP_BLOCK_SIZE = 32, WARP_K_ITER = 2, NUM_THREADS = 128; 
-        dim3 threadsPerBlock(NUM_THREADS);
-        dim3 blocksPerGrid((K + BLOCK_SIZE - 1) / BLOCK_SIZE,
-                        (M + BLOCK_SIZE - 1) / BLOCK_SIZE);
+    const int BLOCK_M = 64, BLOCK_N = 64, BLOCK_K = 16;
+    const int WARP_ROWS = 2, WARP_COLS = 2;
+    const int NUM_THREADS = WARP_ROWS * WARP_COLS * 32;
 
-        matmul_vectorized<BLOCK_SIZE, WARP_BLOCK_SIZE, WARP_K_ITER, T, NUM_THREADS><<<blocksPerGrid, threadsPerBlock>>>(A, B, C, M, N, K);
-        cudaDeviceSynchronize();
-    } else {
-        dim3 threadsPerBlock(32, 32);
-        dim3 blocksPerGrid((K + threadsPerBlock.x - 1) / threadsPerBlock.x,
-                        (M + threadsPerBlock.y - 1) / threadsPerBlock.y);
+    dim3 threadsPerBlock(NUM_THREADS);
+    dim3 blocksPerGrid((K + BLOCK_N - 1) / BLOCK_N,
+                       (M + BLOCK_M - 1) / BLOCK_M);
 
-        matmul<<<blocksPerGrid, threadsPerBlock>>>(A, B, C, M, N, K);
-        cudaDeviceSynchronize();
-    }
+    matmul_vectorized<BLOCK_M, BLOCK_N, BLOCK_K, WARP_ROWS, WARP_COLS, NUM_THREADS>
+        <<<blocksPerGrid, threadsPerBlock>>>(A, B, C, M, N, K);
+    cudaDeviceSynchronize();
 }
