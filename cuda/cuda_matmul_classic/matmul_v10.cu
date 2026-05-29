@@ -57,13 +57,20 @@ __global__ __launch_bounds__(NUM_THREADS) void matmul_vectorized(
     __shared__ float Bs[BLOCK_K * BLOCK_N];
     __shared__ float Cs[BLOCK_M * BLOCK_N];
 
+    // Each lane owns ACC_ELEMS of every 16x16 accumulator tile.
+    constexpr int ACC_ELEMS = (WMMA_M * WMMA_N) / 32;
     wmma::fragment<wmma::accumulator, WMMA_M, WMMA_N, WMMA_K, float>
         acc[WARP_M_TILES][WARP_N_TILES];
+    // Kahan compensation (the low-order bits dropped by FP32 accumulation).
+    float comp[WARP_M_TILES][WARP_N_TILES][ACC_ELEMS];
     #pragma unroll
     for (int i = 0; i < WARP_M_TILES; i++)
         #pragma unroll
-        for (int j = 0; j < WARP_N_TILES; j++)
+        for (int j = 0; j < WARP_N_TILES; j++) {
             wmma::fill_fragment(acc[i][j], 0.0f);
+            #pragma unroll
+            for (int t = 0; t < ACC_ELEMS; t++) comp[i][j][t] = 0.0f;
+        }
 
     for (int n0 = 0; n0 < N; n0 += BLOCK_K) {
         // Stage A tile (zero-padded outside the matrix).
@@ -83,6 +90,18 @@ __global__ __launch_bounds__(NUM_THREADS) void matmul_vectorized(
             Bs[idx] = (gn < N && gk < K) ? B[OFFSET(gn, gk, K)] : 0.0f;
         }
         __syncthreads();
+
+        // Accumulate this contraction chunk into a fresh partial sum, then fold
+        // it into the master accumulator with Kahan compensation below. Keeping
+        // the per-chunk sum separate bounds the FP32 accumulation error to O(eps)
+        // instead of O(N*eps), which is what dominates once inputs are 3xTF32.
+        wmma::fragment<wmma::accumulator, WMMA_M, WMMA_N, WMMA_K, float>
+            psum[WARP_M_TILES][WARP_N_TILES];
+        #pragma unroll
+        for (int i = 0; i < WARP_M_TILES; i++)
+            #pragma unroll
+            for (int j = 0; j < WARP_N_TILES; j++)
+                wmma::fill_fragment(psum[i][j], 0.0f);
 
         #pragma unroll
         for (int kk = 0; kk < BLOCK_K; kk += WMMA_K) {
@@ -124,11 +143,24 @@ __global__ __launch_bounds__(NUM_THREADS) void matmul_vectorized(
             for (int i = 0; i < WARP_M_TILES; i++)
                 #pragma unroll
                 for (int j = 0; j < WARP_N_TILES; j++) {
-                    wmma::mma_sync(acc[i][j], a_lo[i], b_hi[j], acc[i][j]);
-                    wmma::mma_sync(acc[i][j], a_hi[i], b_lo[j], acc[i][j]);
-                    wmma::mma_sync(acc[i][j], a_hi[i], b_hi[j], acc[i][j]);
+                    wmma::mma_sync(psum[i][j], a_lo[i], b_hi[j], psum[i][j]);
+                    wmma::mma_sync(psum[i][j], a_hi[i], b_lo[j], psum[i][j]);
+                    wmma::mma_sync(psum[i][j], a_hi[i], b_hi[j], psum[i][j]);
                 }
         }
+
+        // Kahan-fold the chunk partial into the master accumulator.
+        #pragma unroll
+        for (int i = 0; i < WARP_M_TILES; i++)
+            #pragma unroll
+            for (int j = 0; j < WARP_N_TILES; j++)
+                #pragma unroll
+                for (int t = 0; t < ACC_ELEMS; t++) {
+                    float y = psum[i][j].x[t] - comp[i][j][t];
+                    float s = acc[i][j].x[t] + y;
+                    comp[i][j][t] = (s - acc[i][j].x[t]) - y;
+                    acc[i][j].x[t] = s;
+                }
         __syncthreads();
     }
 
