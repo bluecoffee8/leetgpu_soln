@@ -1,28 +1,34 @@
 #include <cuda_runtime.h>
+#include <cuda_fp16.h>
 
 __global__ __launch_bounds__(1024) void matmul(half* A, half* B, half* C, int M, int N, int K, float alpha, float beta) {
     int m = blockIdx.y * blockDim.y + threadIdx.y;
     int k = blockIdx.x * blockDim.x + threadIdx.x;
 
-    float tmp = 0.0;
+    float tmp = 0.0f;
     for (int n = 0; n < N; n++) {
-        tmp += A[m * N + n] * B[n * K + k];
+        tmp += __half2float(A[m * N + n]) * __half2float(B[n * K + k]);
     }
     if (m < M && k < K) {
-        C[m * K + k] = alpha * tmp + beta * C[m * K + k]; 
+        C[m * K + k] = __float2half(alpha * tmp + beta * __half2float(C[m * K + k]));
     }
 }
 
 const int WARPSIZE = 32;
 #define OFFSET(row, col, ld) ((row)*(ld)+(col))
-#define FETCH_FLOAT4(pointer) (reinterpret_cast<float4*>(&(pointer))[0])
+
+// A 4-wide half vector (64-bit). Used for vectorized 64-bit loads/stores of half data.
+// __align__(8) lets the compiler emit a single LD.64 / ST.64 instruction.
+struct __align__(8) half4 { half x, y, z, w; };
+#define FETCH_HALF4(pointer) (reinterpret_cast<half4*>(&(pointer))[0])
 
 namespace wt {
-    template<const int BLOCK_SIZE, const int a_stride, const int b_stride> 
-    __device__ void load_from_gmem(float* A, float* B, float* As, float* Bs, int a_m, int a_n, int b_n, int b_k, int N, int K) {
+    template<const int BLOCK_SIZE, const int a_stride, const int b_stride>
+    __device__ void load_from_gmem(half* A, half* B, half* As, half* Bs, int a_m, int a_n, int b_n, int b_k, int N, int K) {
         #pragma unroll
         for (int i = 0; i + a_stride <= BLOCK_SIZE; i += a_stride) {
-            const float4 tmp = FETCH_FLOAT4(A[OFFSET(a_m + i, a_n, N)]);
+            const half4 tmp = FETCH_HALF4(A[OFFSET(a_m + i, a_n, N)]);
+            // Transposed store into As (so the contraction dim becomes the leading dim).
             As[OFFSET(a_n, a_m + i, BLOCK_SIZE)] = tmp.x;
             As[OFFSET(a_n + 1, a_m + i, BLOCK_SIZE)] = tmp.y;
             As[OFFSET(a_n + 2, a_m + i, BLOCK_SIZE)] = tmp.z;
@@ -30,26 +36,27 @@ namespace wt {
         }
         #pragma unroll
         for (int i = 0; i + b_stride <= BLOCK_SIZE; i += b_stride) {
-            FETCH_FLOAT4(Bs[OFFSET(b_n + i, b_k, BLOCK_SIZE)]) = FETCH_FLOAT4(B[OFFSET(b_n + i, b_k, K)]);
+            FETCH_HALF4(Bs[OFFSET(b_n + i, b_k, BLOCK_SIZE)]) = FETCH_HALF4(B[OFFSET(b_n + i, b_k, K)]);
         }
     }
 
     template<const int BLOCK_SIZE, const int WARP_BLOCK_SIZE, const int WARP_M_ITER, const int WARP_K_ITER, const int WARP_SUB_M, const int WARP_SUB_K, const int T>
-    __device__ void process_from_smem(float* As, float* Bs, float* reg_m, float* reg_k, float* tmp, 
+    __device__ void process_from_smem(half* As, half* Bs, float* reg_m, float* reg_k, float* tmp,
                                       const int warp_m, const int warp_k, const int lane_m, const int lane_k, int n, int N) {
         for (int i = 0; i < BLOCK_SIZE; i++) {
             if (n + i < N) {
-                #pragma unroll 
+                #pragma unroll
                 for (int j = 0; j < WARP_M_ITER; j++) {
                     for (int l = 0; l < T; l++) {
-                        reg_m[j * T + l] = As[i * BLOCK_SIZE + warp_m * WARP_BLOCK_SIZE + j * WARP_SUB_M + lane_m * T + l];
+                        // Convert to float on load; accumulate in float for precision.
+                        reg_m[j * T + l] = __half2float(As[i * BLOCK_SIZE + warp_m * WARP_BLOCK_SIZE + j * WARP_SUB_M + lane_m * T + l]);
                     }
                 }
 
-                #pragma unroll 
+                #pragma unroll
                 for (int j = 0; j < WARP_K_ITER; j++) {
                     for (int l = 0; l < T; l++) {
-                        reg_k[j * T + l] = Bs[i * BLOCK_SIZE + warp_k * WARP_BLOCK_SIZE + j * WARP_SUB_K + lane_k * T + l];
+                        reg_k[j * T + l] = __half2float(Bs[i * BLOCK_SIZE + warp_k * WARP_BLOCK_SIZE + j * WARP_SUB_K + lane_k * T + l]);
                     }
                 }
 
@@ -71,22 +78,22 @@ namespace wt {
 
 template<const int BLOCK_SIZE, const int WARP_BLOCK_SIZE, const int WARP_K_ITER, const int T, const int NUM_THREADS>
 __global__ __launch_bounds__(NUM_THREADS) void matmul_vectorized(half* A, half* B, half* C, int M, int N, int K, float alpha, float beta) {
-    int bm = blockIdx.y; 
+    int bm = blockIdx.y;
     int bk = blockIdx.x;
 
-    const int warp_idx = threadIdx.x / WARPSIZE; 
-    const int warp_m = warp_idx / (BLOCK_SIZE / WARP_BLOCK_SIZE); 
+    const int warp_idx = threadIdx.x / WARPSIZE;
+    const int warp_m = warp_idx / (BLOCK_SIZE / WARP_BLOCK_SIZE);
     const int warp_k = warp_idx % (BLOCK_SIZE / WARP_BLOCK_SIZE);
 
     constexpr int WARP_M_ITER = (WARP_BLOCK_SIZE * WARP_BLOCK_SIZE) / (WARPSIZE * T * T * WARP_K_ITER);
     constexpr int WARP_SUB_M = WARP_BLOCK_SIZE / WARP_M_ITER;
-    constexpr int WARP_SUB_K = WARP_BLOCK_SIZE / WARP_K_ITER; 
+    constexpr int WARP_SUB_K = WARP_BLOCK_SIZE / WARP_K_ITER;
 
     const int lane_idx = threadIdx.x % WARPSIZE;
     const int lane_m = lane_idx / (WARP_SUB_K / T);
-    const int lane_k = lane_idx % (WARP_SUB_K / T); 
+    const int lane_k = lane_idx % (WARP_SUB_K / T);
 
-    __shared__ float As[BLOCK_SIZE * BLOCK_SIZE], Bs[BLOCK_SIZE * BLOCK_SIZE]; 
+    __shared__ half As[BLOCK_SIZE * BLOCK_SIZE], Bs[BLOCK_SIZE * BLOCK_SIZE];
 
     // Advance the block tiles via pointer arithmetic; shared-memory indices stay local.
     A += bm * BLOCK_SIZE * N;
@@ -102,11 +109,10 @@ __global__ __launch_bounds__(NUM_THREADS) void matmul_vectorized(half* A, half* 
     int b_k = (threadIdx.x % (BLOCK_SIZE / 4)) * 4;
     const int b_stride = (NUM_THREADS * 4) / BLOCK_SIZE;
 
-    float tmp[WARP_M_ITER * T * WARP_K_ITER * T] = {0.0f}; 
+    float tmp[WARP_M_ITER * T * WARP_K_ITER * T] = {0.0f};
     float reg_m[WARP_M_ITER * T] = {0.0f};
     float reg_k[WARP_K_ITER * T] = {0.0f};
 
-    #pragma unroll
     for (int n = 0; n < N; n += BLOCK_SIZE) {
         wt::load_from_gmem<BLOCK_SIZE, a_stride, b_stride>(A, B, As, Bs, a_m, a_n, b_n, b_k, N, K);
         __syncthreads();
@@ -120,7 +126,7 @@ __global__ __launch_bounds__(NUM_THREADS) void matmul_vectorized(half* A, half* 
     for (int x = 0; x < WARP_M_ITER; x++) {
         for (int y = 0; y < WARP_K_ITER; y++) {
             // C already points at this warp's tile; move to the current warp subtile.
-            float* Ctmp = C + (x * WARP_SUB_M) * K + (y * WARP_SUB_K);
+            half* Ctmp = C + (x * WARP_SUB_M) * K + (y * WARP_SUB_K);
             for (int i = 0; i < T; i++) {
                 int row = bm * BLOCK_SIZE + warp_m * WARP_BLOCK_SIZE + x * WARP_SUB_M + lane_m * T + i;
                 if (row >= M) break;
@@ -129,16 +135,16 @@ __global__ __launch_bounds__(NUM_THREADS) void matmul_vectorized(half* A, half* 
                     // tmp index must match the accumulation layout in process_from_smem.
                     int idx = (x * T + i) * (WARP_K_ITER * T) + y * T + j;
                     if (col + 3 < K) {
-                        float4 vtmp = FETCH_FLOAT4(Ctmp[OFFSET(lane_m * T + i, lane_k * T + j, K)]);
-                        vtmp.x = alpha * tmp[idx] + beta * vtmp.x;
-                        vtmp.y = alpha * tmp[idx + 1] + beta * vtmp.y;
-                        vtmp.z = alpha * tmp[idx + 2] + beta * vtmp.z;
-                        vtmp.w = alpha * tmp[idx + 3] + beta * vtmp.w;
-                        FETCH_FLOAT4(Ctmp[OFFSET(lane_m * T + i, lane_k * T + j, K)]) = vtmp;
+                        half4 vtmp = FETCH_HALF4(Ctmp[OFFSET(lane_m * T + i, lane_k * T + j, K)]);
+                        vtmp.x = __float2half(alpha * tmp[idx]     + beta * __half2float(vtmp.x));
+                        vtmp.y = __float2half(alpha * tmp[idx + 1] + beta * __half2float(vtmp.y));
+                        vtmp.z = __float2half(alpha * tmp[idx + 2] + beta * __half2float(vtmp.z));
+                        vtmp.w = __float2half(alpha * tmp[idx + 3] + beta * __half2float(vtmp.w));
+                        FETCH_HALF4(Ctmp[OFFSET(lane_m * T + i, lane_k * T + j, K)]) = vtmp;
                     } else {
                         for (int j_ = j; j_ < T && col + (j_ - j) < K; j_++) {
-                            Ctmp[OFFSET(lane_m * T + i, lane_k * T + j_, K)] = alpha * tmp[(x * T + i) * (WARP_K_ITER * T) + y * T + j_]
-                                + beta * Ctmp[OFFSET(lane_m * T + i, lane_k * T + j_, K)];
+                            half& c = Ctmp[OFFSET(lane_m * T + i, lane_k * T + j_, K)];
+                            c = __float2half(alpha * tmp[(x * T + i) * (WARP_K_ITER * T) + y * T + j_] + beta * __half2float(c));
                         }
                     }
                 }
@@ -150,7 +156,7 @@ __global__ __launch_bounds__(NUM_THREADS) void matmul_vectorized(half* A, half* 
 // A, B, C are device pointers (i.e. pointers to memory on the GPU)
 extern "C" void solve(half* A, half* B, half* C, int M, int N, int K, float alpha, float beta) {
     if (M % 4 == 0 && N % 4 == 0 && K % 4 == 0) {
-        const int BLOCK_SIZE = 64, T = 4, WARP_BLOCK_SIZE = 32, WARP_K_ITER = 2, NUM_THREADS = 128; 
+        const int BLOCK_SIZE = 64, T = 4, WARP_BLOCK_SIZE = 32, WARP_K_ITER = 2, NUM_THREADS = 128;
         dim3 threadsPerBlock(NUM_THREADS);
         dim3 blocksPerGrid((K + BLOCK_SIZE - 1) / BLOCK_SIZE,
                         (M + BLOCK_SIZE - 1) / BLOCK_SIZE);
