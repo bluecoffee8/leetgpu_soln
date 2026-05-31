@@ -102,7 +102,7 @@ __device__ void wgmma64(float d[4][8], half* sA, half* sB) {
 }
 
 template<const int BM, const int BN, const int BK, const int WGMMA_M, const int WGMMA_N, const int WGMMA_K, int NUM_THREADS>
-__global__ void __launch_bounds__(NUM_THREADS) gemm(int M, int N, int K, half* C, const CUtensorMap* tensorMapA, const CUtensorMap* tensorMapB) {
+__global__ void __launch_bounds__(NUM_THREADS) gemm(int M, int N, int K, half* C, const half* C_orig, float alpha, float beta, const CUtensorMap* tensorMapA, const CUtensorMap* tensorMapB) {
     __shared__ alignas(128) half sA[BM * BK], sB[BK * BN];
     float d[WGMMA_N/16][8];
     static_assert(sizeof(d) * 128 == BM * BN * sizeof(float));
@@ -150,25 +150,32 @@ __global__ void __launch_bounds__(NUM_THREADS) gemm(int M, int N, int K, half* C
         int lane = tid % 32;
         int warp = tid / 32;
         uint32_t row = warp * 16 + lane / 4;
-        half *block_C = C + num_block_n * BN * M + num_block_m * BM;
 
         for (int m_it = 0; m_it < BM / WGMMA_M; m_it++) {
             for (int n_it = 0; n_it < BN / WGMMA_N; n_it++) {
                 for (int w = 0; w < WGMMA_N/16; w++) {
                     int col = 16 * w + 2 * (tid % 4);
-                    #define IDX(i, j) ((j + n_it * WGMMA_N) * M + ((i) + m_it * WGMMA_M))
+                    // GEMM epilogue: out = alpha * (A @ B) + beta * C_orig.
+                    // C (temp) is column-major M x N (index n_global*M + m_global);
+                    // C_orig is row-major M x N (index m_global*N + n_global).
+                    #define STORE(i, j, val) do {                                          \
+                        int m_g = num_block_m * BM + m_it * WGMMA_M + (i);                 \
+                        int n_g = num_block_n * BN + n_it * WGMMA_N + (j);                 \
+                        float c_old = __half2float(C_orig[m_g * N + n_g]);                 \
+                        C[n_g * M + m_g] = __float2half(alpha * (val) + beta * c_old);     \
+                    } while (0)
 
-                    block_C[IDX(row, col)] = d[w][0];
-                    block_C[IDX(row, col+1)] = d[w][1];
-                    block_C[IDX(row+8, col)] = d[w][2];
-                    block_C[IDX(row+8, col+1)] = d[w][3]; 
+                    STORE(row,   col,     d[w][0]);
+                    STORE(row,   col + 1, d[w][1]);
+                    STORE(row+8, col,     d[w][2]);
+                    STORE(row+8, col + 1, d[w][3]);
 
-                    block_C[IDX(row, col+8)] = d[w][4];
-                    block_C[IDX(row, col+9)] = d[w][5];
-                    block_C[IDX(row+8, col+8)] = d[w][6];
-                    block_C[IDX(row+8, col+9)] = d[w][7];
+                    STORE(row,   col + 8, d[w][4]);
+                    STORE(row,   col + 9, d[w][5]);
+                    STORE(row+8, col + 8, d[w][6]);
+                    STORE(row+8, col + 9, d[w][7]);
 
-                    #undef IDX
+                    #undef STORE
                 }
             }
         }
@@ -206,7 +213,7 @@ extern "C" void solve(half* A, half* B_, half* C_, int M, int N, int K, float al
         d_tma_map_A = allocate_and_create_tensor_map<BM, BK>(A, M / BM, K / BK);
         d_tma_map_B = allocate_and_create_tensor_map<BN, BK>(B, N / BN, K / BK);
         dim3 gemm_grid((M / BM) * (N / BN));
-        gemm<BM, BN, BK, WGMMA_M, WGMMA_N, WGMMA_K, NUM_THREADS><<<gemm_grid, NUM_THREADS>>>(M, N, K, C, d_tma_map_A, d_tma_map_B);
+        gemm<BM, BN, BK, WGMMA_M, WGMMA_N, WGMMA_K, NUM_THREADS><<<gemm_grid, NUM_THREADS>>>(M, N, K, C, C_, alpha, beta, d_tma_map_A, d_tma_map_B);
         dim3 transpose_block_C(32, 32), transpose_grid_C((M + 31) / 32, (N + 31) / 32);
         transpose_kernel<<<transpose_grid_C, transpose_block_C>>>(C_, C, N, M);
     } else {
