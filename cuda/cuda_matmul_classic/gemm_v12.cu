@@ -218,10 +218,10 @@ extern "C" void solve(half* A, half* B_, half* C_, int M, int N, int K, float al
         transpose_kernel<<<transpose_grid_C, transpose_block_C>>>(C_, C, N, M);
     } else {
         dim3 threadsPerBlock(32, 32);
-        dim3 blocksPerGrid((K + threadsPerBlock.x - 1) / threadsPerBlock.x,
+        dim3 blocksPerGrid((N + threadsPerBlock.x - 1) / threadsPerBlock.x,
                         (M + threadsPerBlock.y - 1) / threadsPerBlock.y);
 
-        gemm_simple<<<blocksPerGrid, threadsPerBlock>>>(A, B_, C_, M, N, K, alpha, beta);
+        gemm_simple<<<blocksPerGrid, threadsPerBlock>>>(A, B_, C_, M, K, N, alpha, beta);
         cudaDeviceSynchronize();
     }
 }
