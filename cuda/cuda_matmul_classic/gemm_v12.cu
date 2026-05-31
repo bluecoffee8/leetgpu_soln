@@ -1,7 +1,11 @@
 #include <cuda.h>
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
+#include <cuda/barrier>
 #include <cstdint>
+#include <cstring>
+#include <cassert>
+#include <utility>
 
 __global__ __launch_bounds__(1024) void gemm_simple(half* A, half* B, half* C, int M, int N, int K, float alpha, float beta) {
     int m = blockIdx.y * blockDim.y + threadIdx.y;
@@ -57,7 +61,7 @@ void create_tensor_map(CUtensorMap *tma_map, half* gmem_ptr, int blocks_height, 
         tma_map, CU_TENSOR_MAP_DATA_TYPE_FLOAT16, 2, gmem_address, gmem_prob_shape, 
         gmem_prob_stride + 1, smem_box_shape, smem_box_stride, CU_TENSOR_MAP_INTERLEAVE_NONE, 
         CU_TENSOR_MAP_SWIZZLE_128B, CU_TENSOR_MAP_L2_PROMOTION_NONE, CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE
-    )
+    );
 
     assert(result == CUDA_SUCCESS);
 }
@@ -152,7 +156,7 @@ __global__ void __launch_bounds__(NUM_THREADS) gemm(int M, int N, int K, half* C
             for (int n_it = 0; n_it < BN / WGMMA_N; n_it++) {
                 for (int w = 0; w < WGMMA_N/16; w++) {
                     int col = 16 * w + 2 * (tid % 4);
-                    #define IDX(i, j) ((j + n_it * WGMMA_N) * M + ((i) + m_it * WGMMA_M));
+                    #define IDX(i, j) ((j + n_it * WGMMA_N) * M + ((i) + m_it * WGMMA_M))
 
                     block_C[IDX(row, col)] = d[w][0];
                     block_C[IDX(row, col+1)] = d[w][1];
@@ -193,16 +197,16 @@ __global__ void transpose_kernel(half* __restrict__ out, const half* __restrict_
 // A, B, and C are device pointers
 extern "C" void solve(half* A, half* B_, half* C_, int M, int N, int K, float alpha,
                       float beta) {
-    if (M % 64 == 0 && N % 64 == 0 && K % 64 == 0) { 
-        constexpr BM = 64, BN = 64, BK = 64, NUM_THREADS = 128, WGMMA_M = 64, WGMMA_N = 64, WGMMA_K = 16;
+    if (M % 64 == 0 && N % 64 == 0 && K % 64 == 0) {
+        constexpr int BM = 64, BN = 64, BK = 64, NUM_THREADS = 128, WGMMA_M = 64, WGMMA_N = 64, WGMMA_K = 16;
         // tranpose matrix B
-        half* B, C; cudaMalloc(&B, N * K * sizeof(half)); cudaMalloc(&C, M * N * sizeof(half));
+        half *B, *C; cudaMalloc(&B, N * K * sizeof(half)); cudaMalloc(&C, M * N * sizeof(half));
         dim3 transpose_block_B(32, 32), transpose_grid_B((N + 31) / 32, (K + 31) / 32);
-        transpose_kernel<<<transpose_grid_B, transpose_block_B>>>(B, B_, K, N); 
-        constexpr int BM = 64, BN = 64, BK = 64, NUM_THEADS = 128;
-        d_tma_map_A = allocate_and_create_tensor_map<BM, BK>(A, M / BM, K / BK); 
+        transpose_kernel<<<transpose_grid_B, transpose_block_B>>>(B, B_, K, N);
+        d_tma_map_A = allocate_and_create_tensor_map<BM, BK>(A, M / BM, K / BK);
         d_tma_map_B = allocate_and_create_tensor_map<BN, BK>(B, N / BN, K / BK);
-        gemm<BM, BN, BK, WGMMA_M, WGMMA_N, WGMMA_K, NUM_THREADS>>>(M, N, K, C, d_tma_map_A, d_tma_map_B); 
+        dim3 gemm_grid((M / BM) * (N / BN));
+        gemm<BM, BN, BK, WGMMA_M, WGMMA_N, WGMMA_K, NUM_THREADS><<<gemm_grid, NUM_THREADS>>>(M, N, K, C, d_tma_map_A, d_tma_map_B);
         dim3 transpose_block_C(32, 32), transpose_grid_C((M + 31) / 32, (N + 31) / 32);
         transpose_kernel<<<transpose_grid_C, transpose_block_C>>>(C_, C, N, M);
     } else {
@@ -210,7 +214,7 @@ extern "C" void solve(half* A, half* B_, half* C_, int M, int N, int K, float al
         dim3 blocksPerGrid((K + threadsPerBlock.x - 1) / threadsPerBlock.x,
                         (M + threadsPerBlock.y - 1) / threadsPerBlock.y);
 
-        gemm_simple<<<blocksPerGrid, threadsPerBlock>>>(A, B, C, M, N, K, alpha, beta);
+        gemm_simple<<<blocksPerGrid, threadsPerBlock>>>(A, B_, C_, M, N, K, alpha, beta);
         cudaDeviceSynchronize();
     }
 }
