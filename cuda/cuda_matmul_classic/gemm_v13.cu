@@ -78,12 +78,12 @@ __host__ static inline CUtensorMap* allocate_and_create_tensor_map(half* src, in
 }
 
 template<int ScaleD, int ScaleA, int ScaleB, int TransA, int TransB>
-__device__ void wgmma256(float d[16][8], bf16* sA, bf16* sB) {
+__device__ void wgmma256(float d[16][8], half* sA, half* sB) {
     uint64_t desc_a = make_smem_desc(&sA[0]);
     uint64_t desc_b = make_smem_desc(&sB[0]);
     asm volatile(
         "{\n"
-        "wgmma.mma_async.sync.aligned.m64n256k16.f32.bf16.bf16 "
+        "wgmma.mma_async.sync.aligned.m64n256k16.f32.f16.f16 "
         "{%0,   %1,   %2,   %3,   %4,   %5,   %6,   %7,   "
         " %8,   %9,   %10,  %11,  %12,  %13,  %14,  %15,  "
         " %16,  %17,  %18,  %19,  %20,  %21,  %22,  %23,  "
@@ -125,12 +125,12 @@ __device__ void wgmma256(float d[16][8], bf16* sA, bf16* sB) {
 }
 
 template<int ScaleD, int ScaleA, int ScaleB, int TransA, int TransB>
-__device__ void wgmma128(float d[8][8], bf16* sA, bf16* sB) {
+__device__ void wgmma128(float d[8][8], half* sA, half* sB) {
     uint64_t desc_a = make_smem_desc(&sA[0]);
     uint64_t desc_b = make_smem_desc(&sB[0]);
     asm volatile(
         "{\n"
-        "wgmma.mma_async.sync.aligned.m64n128k16.f32.bf16.bf16 "
+        "wgmma.mma_async.sync.aligned.m64n128k16.f32.f16.f16 "
         "{%0,   %1,   %2,   %3,   %4,   %5,   %6,   %7,   "
         " %8,   %9,   %10,  %11,  %12,  %13,  %14,  %15,  "
         " %16,  %17,  %18,  %19,  %20,  %21,  %22,  %23,  "
@@ -159,12 +159,12 @@ __device__ void wgmma128(float d[8][8], bf16* sA, bf16* sB) {
 }
 
 template<int ScaleD, int ScaleA, int ScaleB, int TransA, int TransB>
-__device__ __forceinline__ void wgmma192(float d[12][8], bf16* sA, bf16* sB) {
+__device__ __forceinline__ void wgmma192(float d[12][8], half* sA, half* sB) {
     uint64_t desc_a = make_smem_desc(&sA[0]);
     uint64_t desc_b = make_smem_desc(&sB[0]);
     asm volatile(
         "{\n"
-        "wgmma.mma_async.sync.aligned.m64n192k16.f32.bf16.bf16 "
+        "wgmma.mma_async.sync.aligned.m64n192k16.f32.f16.f16 "
         "{%0,   %1,   %2,   %3,   %4,   %5,   %6,   %7,   "
         " %8,   %9,   %10,  %11,  %12,  %13,  %14,  %15,  "
         " %16,  %17,  %18,  %19,  %20,  %21,  %22,  %23,  "
@@ -198,12 +198,12 @@ __device__ __forceinline__ void wgmma192(float d[12][8], bf16* sA, bf16* sB) {
 }
 
 template<int ScaleD, int ScaleA, int ScaleB, int TransA, int TransB>
-__device__ void wgmma64(float d[4][8], bf16* sA, bf16* sB) {
+__device__ void wgmma64(float d[4][8], half* sA, half* sB) {
     uint64_t desc_a = make_smem_desc(&sA[0]);
     uint64_t desc_b = make_smem_desc(&sB[0]);
     asm volatile(
         "{\n"
-        "wgmma.mma_async.sync.aligned.m64n64k16.f32.bf16.bf16 "
+        "wgmma.mma_async.sync.aligned.m64n64k16.f32.f16.f16 "
         "{%0,   %1,   %2,   %3,   %4,   %5,   %6,   %7,   "
         " %8,   %9,   %10,  %11,  %12,  %13,  %14,  %15,  "
         " %16,  %17,  %18,  %19,  %20,  %21,  %22,  %23,  "
@@ -223,12 +223,12 @@ __device__ void wgmma64(float d[4][8], bf16* sA, bf16* sB) {
 }
 
 template<int ScaleD, int ScaleA, int ScaleB, int TransA, int TransB>
-__device__ void wgmma32(float d[2][8], bf16* sA, bf16* sB) {
+__device__ void wgmma32(float d[2][8], half* sA, half* sB) {
     uint64_t desc_a = make_smem_desc(&sA[0]);
     uint64_t desc_b = make_smem_desc(&sB[0]);
     asm volatile(
         "{\n"
-        "wgmma.mma_async.sync.aligned.m64n32k16.f32.bf16.bf16 "
+        "wgmma.mma_async.sync.aligned.m64n32k16.f32.f16.f16 "
         "{%0,   %1,   %2,   %3,   %4,   %5,   %6,   %7,   "
         " %8,   %9,   %10,  %11,  %12,  %13,  %14,  %15},  "
         " %16,"
@@ -243,12 +243,12 @@ __device__ void wgmma32(float d[2][8], bf16* sA, bf16* sB) {
 }
 
 template<int ScaleD, int ScaleA, int ScaleB, int TransA, int TransB>
-__device__ void wgmma16(float d[1][8], bf16* sA, bf16* sB) {
+__device__ void wgmma16(float d[1][8], half* sA, half* sB) {
     uint64_t desc_a = make_smem_desc(&sA[0]);
     uint64_t desc_b = make_smem_desc(&sB[0]);
     asm volatile(
         "{\n"
-        "wgmma.mma_async.sync.aligned.m64n16k16.f32.bf16.bf16 "
+        "wgmma.mma_async.sync.aligned.m64n16k16.f32.f16.f16 "
         "{%0,   %1,   %2,   %3,   %4,   %5,   %6,   %7},   "
         " %8,"
         " %9,"
@@ -261,7 +261,7 @@ __device__ void wgmma16(float d[1][8], bf16* sA, bf16* sB) {
 }
 
 template<int WGMMA_N, int ScaleD, int ScaleA, int ScaleB, int TransA, int TransB>
-__device__ inline void wgmma(float d[WGMMA_N/16][8], bf16* sA, bf16* sB) {
+__device__ inline void wgmma(float d[WGMMA_N/16][8], half* sA, half* sB) {
     static_assert(WGMMA_N == 32 || WGMMA_N == 64 || WGMMA_N == 128 || WGMMA_N == 192 || WGMMA_N == 256);
     if  constexpr (WGMMA_N == 256)
         wgmma256<1, 1, 1, 0, 0>(d, sA, sB);
@@ -277,8 +277,8 @@ __device__ inline void wgmma(float d[WGMMA_N/16][8], bf16* sA, bf16* sB) {
 
 template <int BM, int BN, int BK>
 struct SMem {
-    alignas(128) bf16 A[BM*BK];
-    alignas(128) bf16 B[BK*BN];
+    alignas(128) half A[BM*BK];
+    alignas(128) half B[BK*BN];
 };
 
 template<const int BM, const int BN, const int BK, int NUM_THREADS>
@@ -342,34 +342,35 @@ __global__ void __launch_bounds__(NUM_THREADS) gemm(int M, int N, int K, half* C
 
         // TODO: fix code below based on [https://github.com/pranjalssh/fast.cu/blob/main/examples/matmul/matmul_3.cuh]
 
-        for (int m_it = 0; m_it < BM / WGMMA_M; m_it++) {
-            for (int n_it = 0; n_it < BN / WGMMA_N; n_it++) {
-                for (int w = 0; w < WGMMA_N/16; w++) {
-                    int col = 16 * w + 2 * (tid % 4);
-                    // GEMM epilogue: out = alpha * (A @ B) + beta * C_orig.
-                    // C (temp) is column-major M x N (index n_global*M + m_global);
-                    // C_orig is row-major M x N (index m_global*N + n_global).
-                    #define STORE(i, j, val) do {                                          \
-                        int m_g = num_block_m * BM + m_it * WGMMA_M + (i);                 \
-                        int n_g = num_block_n * BN + n_it * WGMMA_N + (j);                 \
-                        float c_old = __half2float(C_orig[m_g * N + n_g]);                 \
-                        C[n_g * M + m_g] = __float2half(alpha * (val) + beta * c_old);     \
-                    } while (0)
+        for (int m_it = 0; m_it < B_WG_M / WGMMA_M; m_it++) {
+            int yo = m_it * WGMMA_M + wg_idx * B_WG_M;
+            for (int w = 0; w < WGMMA_N / 16; w++) {
+                int col = 16 * w + 2 * (tid % 4);
+                // GEMM epilogue: out = alpha * (A @ B) + beta * C_orig.
+                // C (temp) is column-major M x N (index n_global*M + m_global);
+                // C_orig is row-major M x N (index m_global*N + n_global).
+                #define STORE(i, j, val) do {                                          \
+                    int m_g = num_block_m * BM + yo + (i);                             \
+                    int n_g = num_block_n * BN + (j);                                  \
+                    float c_old = __half2float(C_orig[m_g * N + n_g]);                 \
+                    C[n_g * M + m_g] = __float2half(alpha * (val) + beta * c_old);     \
+                } while (0)
 
-                    STORE(row,   col,     d[w][0]);
-                    STORE(row,   col + 1, d[w][1]);
-                    STORE(row+8, col,     d[w][2]);
-                    STORE(row+8, col + 1, d[w][3]);
+                STORE(row,   col,     d[m_it][w][0]);
+                STORE(row,   col + 1, d[m_it][w][1]);
+                STORE(row+8, col,     d[m_it][w][2]);
+                STORE(row+8, col + 1, d[m_it][w][3]);
 
-                    STORE(row,   col + 8, d[w][4]);
-                    STORE(row,   col + 9, d[w][5]);
-                    STORE(row+8, col + 8, d[w][6]);
-                    STORE(row+8, col + 9, d[w][7]);
+                STORE(row,   col + 8, d[m_it][w][4]);
+                STORE(row,   col + 9, d[m_it][w][5]);
+                STORE(row+8, col + 8, d[m_it][w][6]);
+                STORE(row+8, col + 9, d[m_it][w][7]);
 
-                    #undef STORE
-                }
+                #undef STORE
             }
         }
+
+        // END TODO
     }
 }
 
