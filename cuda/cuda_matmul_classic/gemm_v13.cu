@@ -285,7 +285,8 @@ template<const int BM, const int BN, const int BK, int NUM_THREADS>
 __global__ void __launch_bounds__(NUM_THREADS) gemm(int M, int N, int K, half* C, const half* C_orig, float alpha, float beta, const CUtensorMap* tensorMapA, const CUtensorMap* tensorMapB) {
     constexpr int WGMMA_M = 64, WGMMA_K = 16, WGMMA_N=BN;
     constexpr int B_WG_M = BM / (NUM_THREADS / 128);
-    extern __shared__ SMem<BM, BN, BK> s;
+    extern __shared__ __align__(128) uint8_t smem[];
+    SMem<BM, BN, BK> &s = *reinterpret_cast<SMem<BM, BN, BK>*>(smem);
 
     half *sA = s.A, *sB = s.B;
     #pragma nv_diag_suppress static_var_with_dynamic_init
@@ -311,9 +312,9 @@ __global__ void __launch_bounds__(NUM_THREADS) gemm(int M, int N, int K, half* C
     for (int block_k_iter = 0; block_k_iter < num_blocks_k; block_k_iter++) {
         if (threadIdx.x == 0) {
             cde::cp_async_bulk_tensor_2d_global_to_shared(&sA[0], tensorMapA, block_k_iter * BK, num_block_m * BM, barA);
-            tokenA = cuda::device::barrier_arrive_tx(barA, 1, sizeof(sA));
+            tokenA = cuda::device::barrier_arrive_tx(barA, 1, BK * BM * sizeof(half));
             cde::cp_async_bulk_tensor_2d_global_to_shared(&sB[0], tensorMapB, block_k_iter * BK, num_block_n * BN, barB);
-            tokenB = cuda::device::barrier_arrive_tx(barB, 1, sizeof(sB)); 
+            tokenB = cuda::device::barrier_arrive_tx(barB, 1, BK * BN * sizeof(half));
         } else {
             tokenA = barA.arrive();
             tokenB = barB.arrive();
@@ -396,7 +397,7 @@ __global__ void transpose_kernel(half* __restrict__ out, const half* __restrict_
 // A, B, and C are device pointers
 extern "C" void solve(half* A, half* B_, half* C_, int M, int N, int K, float alpha,
                       float beta) {
-    if (M % 64 == 0 && N % 64 == 0 && K % 64 == 0) {
+    if (M % 256 == 0 && N % 256 == 0 && K % 256 == 0) {
         // tranpose matrix B
         half *B, *C; cudaMalloc(&B, N * K * sizeof(half)); cudaMalloc(&C, M * N * sizeof(half));
         dim3 transpose_block_B(32, 32), transpose_grid_B((N + 31) / 32, (K + 31) / 32);
