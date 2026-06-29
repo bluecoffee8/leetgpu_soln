@@ -1,0 +1,11 @@
+import jax
+import jax.numpy as jnp
+
+
+# input is a tensor on device
+# @jax.jit
+def solve(
+    input: jax.Array, N: int, M: int, S_ROW: int, E_ROW: int, S_COL: int, E_COL: int
+) -> jax.Array:
+    # return output tensor directly
+    return input[S_ROW : E_ROW+1, S_COL : E_COL+1].sum()
